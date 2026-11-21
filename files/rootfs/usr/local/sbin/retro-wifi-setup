@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Reads retro-wifi.txt from the SD card's boot partition at startup and
+# connects to that Wi-Fi network. Afterwards the password is removed from the file.
+set -u
+BOOT=/boot/firmware; [[ -d $BOOT ]] || BOOT=/boot
+FILE="$BOOT/retro-wifi.txt"
+[[ -f "$FILE" ]] || exit 0
+
+val() { LC_ALL=C sed 's/^\xEF\xBB\xBF//; s/\r$//' "$FILE" | grep -i -m1 "^[[:space:]]*$1[[:space:]]*=" | sed 's/^[^=]*=//; s/^[[:space:]]*//; s/[[:space:]]*$//'; }
+SSID="$(val SSID)"; PASS="$(val PASSWORD)"; COUNTRY="$(val COUNTRY)"; TZ_NEW="$(val TIMEZONE)"
+COUNTRY="${COUNTRY:-DK}"
+
+if [[ -n "$TZ_NEW" && -f "/usr/share/zoneinfo/$TZ_NEW" ]]; then
+  timedatectl set-timezone "$TZ_NEW" 2>/dev/null || ln -sf "/usr/share/zoneinfo/$TZ_NEW" /etc/localtime
+fi
+[[ -z "$SSID" ]] && exit 0
+
+if command -v raspi-config >/dev/null; then
+  raspi-config nonint do_wifi_country "${COUNTRY^^}" || true
+else
+  iw reg set "${COUNTRY^^}" 2>/dev/null || true
+fi
+rfkill unblock wifi 2>/dev/null || true
+
+nmcli connection delete retro-wifi >/dev/null 2>&1 || true
+if [[ -n "$PASS" ]]; then
+  nmcli connection add type wifi con-name retro-wifi ifname wlan0 ssid "$SSID" \
+    wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$PASS" connection.autoconnect yes
+else
+  nmcli connection add type wifi con-name retro-wifi ifname wlan0 ssid "$SSID" connection.autoconnect yes
+fi
+nmcli connection up retro-wifi >/dev/null 2>&1 || true   # keeps retrying on its own if out of range
+
+cat > "$FILE" <<TXT
+# RetroPi saved your Wi-Fi network "$SSID".
+# To change it, fill in the lines below and put the SD card back in the console.
+SSID=
+PASSWORD=
+COUNTRY=${COUNTRY^^}
+TIMEZONE=${TZ_NEW}
+TXT

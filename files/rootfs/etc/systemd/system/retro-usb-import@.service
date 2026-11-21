@@ -1,0 +1,7 @@
+[Unit]
+Description=RetroPi: copy games from USB stick %I
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/retro-usb-import %I
+TimeoutStartSec=infinity

@@ -1,0 +1,12 @@
+[Unit]
+Description=RetroPi: expand storage and check SSH keys
+DefaultDependencies=no
+After=local-fs.target
+Before=ssh.service getty@tty1.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/retro-boot-check
+
+[Install]
+WantedBy=multi-user.target

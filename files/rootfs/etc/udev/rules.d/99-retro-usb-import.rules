@@ -1,0 +1,2 @@
+# Copy games when a USB stick with a "roms" or "bios" folder is plugged in
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{ID_FS_USAGE}=="filesystem", TAG+="systemd", ENV{SYSTEMD_WANTS}+="retro-usb-import@%k.service"

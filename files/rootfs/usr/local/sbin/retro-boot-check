@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Runs at every boot (fast no-op after the first time):
+#  - grows the system partition to fill the SD card, so all of it holds games
+#  - makes sure SSH host keys exist
+set -u
+ROOT_PART="$(findmnt -no SOURCE /)"
+DISK="$(lsblk -no PKNAME "$ROOT_PART" 2>/dev/null | head -1)"
+PARTNUM="$(cat "/sys/class/block/$(basename "$ROOT_PART")/partition" 2>/dev/null)"
+if [[ -n "$DISK" && -n "$PARTNUM" ]] && command -v growpart >/dev/null; then
+  if growpart "/dev/$DISK" "$PARTNUM" >/dev/null 2>&1; then
+    resize2fs "$ROOT_PART" >/dev/null 2>&1 || true
+    echo "Expanded $ROOT_PART to fill /dev/$DISK"
+  fi
+fi
+if ! ls /etc/ssh/ssh_host_*_key >/dev/null 2>&1; then
+  ssh-keygen -A
+fi
+exit 0

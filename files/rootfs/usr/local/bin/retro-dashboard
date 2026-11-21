@@ -1,0 +1,1322 @@
+#!/usr/bin/env python3
+"""RetroPi dashboard - the console's home screen.
+
+Controller or keyboard:
+  D-pad / arrows   move          A / Enter    open, play
+  B / Esc          back          Y / F        favorite
+  L / R  (PgUp/Dn) jump by letter
+In a game: hold Start + Select for one second to come back here.
+"""
+import json
+import os
+import queue
+import re
+import socket
+import subprocess
+import threading
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+if os.environ.get("WAYLAND_DISPLAY"):
+    os.environ.setdefault("SDL_VIDEODRIVER", "wayland")
+import pygame  # noqa: E402
+
+# ----------------------------------------------------------------- paths ----
+HOME = Path.home()
+RETRO = HOME / "retro"
+ROMS = RETRO / "roms"
+BOXART = RETRO / "boxart"
+STATE_FILE = RETRO / ".dashboard.json"
+CONF = HOME / ".config" / "retro-os"
+CORES = HOME / ".config" / "retroarch" / "cores"
+LOGDIR = HOME / ".cache" / "retro"
+USB_STATUS = Path("/run/retro-os/usb.json")
+FONT_DIR = Path("/usr/share/fonts/truetype/retropi")
+SHARE_NAME = r"\\retropi\retro"
+
+W, H = 1280, 720
+
+# ---------------------------------------------------------------- systems ---
+# Each console gets its own colour; the whole screen takes it on when selected.
+SYSTEMS = [
+    dict(id="nes", tile="NES", name="NES", maker="Nintendo", core="fceumm",
+         exts="nes fds unf unif zip 7z", db="Nintendo - Nintendo Entertainment System", color=(200, 52, 48)),
+    dict(id="snes", tile="SNES", name="Super Nintendo", maker="Nintendo", core="snes9x",
+         exts="smc sfc swc fig bs zip 7z", db="Nintendo - Super Nintendo Entertainment System", color=(104, 76, 178)),
+    dict(id="gb", tile="GB", name="Game Boy", maker="Nintendo", core="gambatte",
+         exts="gb zip 7z", db="Nintendo - Game Boy", color=(139, 172, 15)),
+    dict(id="gbc", tile="GBC", name="Game Boy Color", maker="Nintendo", core="gambatte",
+         exts="gbc zip 7z", db="Nintendo - Game Boy Color", color=(214, 40, 118)),
+    dict(id="gba", tile="GBA", name="Game Boy Advance", maker="Nintendo", core="mgba",
+         exts="gba zip 7z", db="Nintendo - Game Boy Advance", color=(78, 66, 196)),
+    dict(id="n64", tile="N64", name="Nintendo 64", maker="Nintendo", core="mupen64plus_next",
+         exts="n64 z64 v64 zip 7z", db="Nintendo - Nintendo 64", color=(22, 140, 82)),
+    dict(id="megadrive", tile="MD", name="Mega Drive", maker="Sega", core="genesis_plus_gx",
+         exts="md gen smd bin zip 7z", db="Sega - Mega Drive - Genesis", color=(22, 92, 190)),
+    dict(id="mastersystem", tile="SMS", name="Master System", maker="Sega", core="genesis_plus_gx",
+         exts="sms zip 7z", db="Sega - Master System - Mark III", color=(190, 34, 44)),
+    dict(id="gamegear", tile="GG", name="Game Gear", maker="Sega", core="genesis_plus_gx",
+         exts="gg zip 7z", db="Sega - Game Gear", color=(18, 132, 138)),
+    dict(id="psx", tile="PS1", name="PlayStation", maker="Sony", core="pcsx_rearmed",
+         exts="chd cue pbp m3u", db="Sony - PlayStation", color=(120, 132, 150)),
+    dict(id="pcengine", tile="PCE", name="PC Engine", maker="NEC", core="mednafen_pce_fast",
+         exts="pce zip 7z", db="NEC - PC Engine - TurboGrafx 16", color=(226, 104, 24)),
+    dict(id="atari2600", tile="2600", name="Atari 2600", maker="Atari", core="stella2014",
+         exts="a26 bin zip 7z", db="Atari - 2600", color=(150, 88, 42)),
+    dict(id="arcade", tile="Arcade", name="Arcade", maker="FinalBurn Neo", core="fbneo",
+         exts="zip 7z", db="FBNeo - Arcade Games", color=(214, 20, 96)),
+]
+for _s in SYSTEMS:
+    _s["exts"] = set(_s["exts"].split())
+SYS_BY_ID = {s["id"]: s for s in SYSTEMS}
+
+CONTINUE_COLOR = (36, 120, 112)
+FAVORITES_COLOR = (200, 150, 30)
+SETTINGS_COLOR = (82, 90, 108)
+
+INK = (244, 241, 236)
+BASE = (13, 13, 17)
+
+
+# ---------------------------------------------------------------- helpers ---
+def mix(a, b, t):
+    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+def luminance(c):
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+
+
+def on_color(c):
+    """Readable text colour on top of colour c."""
+    return (18, 16, 20) if luminance(c) > 150 else INK
+
+
+def clean_name(stem):
+    name = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", stem).strip()
+    return name or stem
+
+
+def log(msg):
+    try:
+        LOGDIR.mkdir(parents=True, exist_ok=True)
+        with open(LOGDIR / "dashboard.log", "a") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+    except OSError:
+        pass
+
+
+def run(cmd, timeout=10):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+
+
+def local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("1.1.1.1", 80))  # no packet is sent; just picks the route
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def ago(ts):
+    d = time.time() - ts
+    if d < 120:
+        return "just now"
+    if d < 3600:
+        return f"{int(d // 60)} minutes ago"
+    if d < 86400:
+        h = int(d // 3600)
+        return "1 hour ago" if h == 1 else f"{h} hours ago"
+    days = int(d // 86400)
+    return "yesterday" if days == 1 else f"{days} days ago"
+
+
+# ---------------------------------------------------------------- library ---
+class Game:
+    __slots__ = ("path", "system", "stem", "name")
+
+    def __init__(self, path, system):
+        self.path = path
+        self.system = system
+        self.stem = path.stem
+        self.name = clean_name(path.stem)
+
+
+def scan_library():
+    lib = {}
+    for s in SYSTEMS:
+        folder = ROMS / s["id"]
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        if not folder.is_dir():
+            lib[s["id"]] = []
+            continue
+        hidden = set()
+        for m3u in folder.rglob("*.m3u"):
+            try:
+                for line in m3u.read_text(errors="ignore").splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        hidden.add(Path(line).name.lower())
+            except OSError:
+                pass
+        games = []
+        for p in folder.rglob("*"):
+            if (p.is_file() and not p.name.startswith(".")
+                    and p.suffix.lower().lstrip(".") in s["exts"]
+                    and p.name.lower() not in hidden):
+                games.append(Game(p, s["id"]))
+        games.sort(key=lambda g: g.name.casefold())
+        lib[s["id"]] = games
+    return lib
+
+
+class State:
+    def __init__(self):
+        self.favorites = set()
+        self.history = []          # [{"path":..., "system":..., "time":...}] newest first
+        self.boxart = True
+        self.load()
+
+    def load(self):
+        try:
+            d = json.loads(STATE_FILE.read_text())
+            self.favorites = set(d.get("favorites", []))
+            self.history = d.get("history", [])[:50]
+            self.boxart = d.get("boxart", True)
+        except (OSError, ValueError):
+            pass
+
+    def save(self):
+        try:
+            tmp = STATE_FILE.with_name(".dashboard.tmp")
+            tmp.write_text(json.dumps({"favorites": sorted(self.favorites),
+                                       "history": self.history[:50],
+                                       "boxart": self.boxart}, indent=1))
+            tmp.replace(STATE_FILE)
+        except OSError as e:
+            log(f"state save failed: {e}")
+
+    def played(self, game):
+        p = str(game.path)
+        self.history = [h for h in self.history if h.get("path") != p]
+        self.history.insert(0, {"path": p, "system": game.system, "time": time.time()})
+        self.save()
+
+    def last_played(self, game):
+        p = str(game.path)
+        for h in self.history:
+            if h.get("path") == p:
+                return h.get("time")
+        return None
+
+
+# ---------------------------------------------------------------- box art ---
+def art_path(game):
+    for ext in (".png", ".jpg", ".jpeg"):
+        p = BOXART / game.system / (game.stem + ext)
+        if p.exists():
+            return p
+    return None
+
+
+class ArtFetcher(threading.Thread):
+    """Downloads cover art from the libretro thumbnail server in the background."""
+    BASE = "https://thumbnails.libretro.com"
+
+    def __init__(self, on_done):
+        super().__init__(daemon=True)
+        self.q = queue.Queue()
+        self.on_done = on_done
+        self.enabled = True
+        self.missing_file = BOXART / ".missing.json"
+        try:
+            self.missing = set(json.loads(self.missing_file.read_text()))
+        except (OSError, ValueError):
+            self.missing = set()
+        self.queued = set()
+
+    def want(self, games):
+        for g in games:
+            key = f"{g.system}/{g.stem}"
+            if key in self.missing or key in self.queued or art_path(g):
+                continue
+            self.queued.add(key)
+            self.q.put(g)
+
+    def forget_missing(self):
+        self.missing.clear()
+        self._save_missing()
+
+    def _save_missing(self):
+        try:
+            BOXART.mkdir(parents=True, exist_ok=True)
+            self.missing_file.write_text(json.dumps(sorted(self.missing)))
+        except OSError:
+            pass
+
+    def run(self):
+        misses = 0
+        while True:
+            g = self.q.get()
+            key = f"{g.system}/{g.stem}"
+            self.queued.discard(key)
+            if not self.enabled or not local_ip():
+                continue
+            sys = SYS_BY_ID[g.system]
+            safe = re.sub(r'[&*/:`<>?\\|"]', "_", g.stem)
+            clean = re.sub(r'[&*/:`<>?\\|"]', "_", g.name)
+            names = [safe] + [f"{clean} ({r})" for r in ("USA", "Europe", "World", "Japan")]
+            got = False
+            for n in dict.fromkeys(names):
+                url = (f"{self.BASE}/{urllib.parse.quote(sys['db'])}/Named_Boxarts/"
+                       f"{urllib.parse.quote(n)}.png")
+                try:
+                    req = urllib.request.Request(url, headers={"User-Agent": "RetroPi-OS"})
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        data = r.read()
+                    if data[:8] == b"\x89PNG\r\n\x1a\n":
+                        dest = BOXART / g.system / (g.stem + ".png")
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        tmp = dest.with_name(dest.name + ".part")
+                        tmp.write_bytes(data)
+                        tmp.replace(dest)
+                        got = True
+                        break
+                except Exception:
+                    pass
+            if got:
+                self.on_done(g)
+            else:
+                self.missing.add(key)
+                misses += 1
+                if misses % 10 == 0:
+                    self._save_missing()
+            time.sleep(0.15)
+
+
+# ---------------------------------------------------------------- input -----
+class Input:
+    """Turns controllers and keyboard into simple actions."""
+    KEYMAP = {
+        pygame.K_UP: "up", pygame.K_DOWN: "down", pygame.K_LEFT: "left", pygame.K_RIGHT: "right",
+        pygame.K_RETURN: "a", pygame.K_KP_ENTER: "a", pygame.K_SPACE: "a",
+        pygame.K_ESCAPE: "b", pygame.K_BACKSPACE: "b",
+        pygame.K_f: "y", pygame.K_PAGEUP: "l", pygame.K_PAGEDOWN: "r",
+        pygame.K_TAB: "start",
+    }
+    DIRS = ("up", "down", "left", "right")
+
+    def __init__(self):
+        self.ctrl_mod = None
+        self.controllers = {}
+        self.joysticks = {}
+        self.ctrl_joy_ids = set()
+        self.axis_state = {}
+        self.held = None
+        self.next_repeat = 0
+        try:
+            from pygame._sdl2 import controller
+            controller.init()
+            self.ctrl_mod = controller
+            c = pygame
+            self.CBTN = {
+                c.CONTROLLER_BUTTON_DPAD_UP: "up", c.CONTROLLER_BUTTON_DPAD_DOWN: "down",
+                c.CONTROLLER_BUTTON_DPAD_LEFT: "left", c.CONTROLLER_BUTTON_DPAD_RIGHT: "right",
+                c.CONTROLLER_BUTTON_A: "a", c.CONTROLLER_BUTTON_B: "b",
+                c.CONTROLLER_BUTTON_X: "x", c.CONTROLLER_BUTTON_Y: "y",
+                c.CONTROLLER_BUTTON_LEFTSHOULDER: "l", c.CONTROLLER_BUTTON_RIGHTSHOULDER: "r",
+                c.CONTROLLER_BUTTON_START: "start", c.CONTROLLER_BUTTON_BACK: "select",
+            }
+        except Exception as e:
+            log(f"controller module unavailable, using joystick fallback: {e}")
+            self.CBTN = {}
+        pygame.joystick.init()
+        for i in range(pygame.joystick.get_count()):
+            self.add_device(i)
+
+    def add_device(self, index):
+        try:
+            if self.ctrl_mod and self.ctrl_mod.is_controller(index):
+                c = self.ctrl_mod.Controller(index)
+                try:
+                    jid = c.as_joystick().get_instance_id()
+                except Exception:
+                    jid = pygame.joystick.Joystick(index).get_instance_id()
+                self.controllers[jid] = c
+                self.ctrl_joy_ids.add(jid)
+                return
+            j = pygame.joystick.Joystick(index)
+            j.init()
+            self.joysticks[j.get_instance_id()] = j
+        except Exception as e:
+            log(f"could not open controller {index}: {e}")
+
+    @property
+    def count(self):
+        return len(self.controllers) + len(self.joysticks)
+
+    def _press(self, action, out):
+        out.append(action)
+        if action in self.DIRS:
+            self.held = action
+            self.next_repeat = time.time() + 0.32
+
+    def _release(self, action):
+        if self.held == action:
+            self.held = None
+
+    def _axis(self, key, value, neg, pos, out):
+        prev = self.axis_state.get(key)
+        cur = neg if value < -0.55 else pos if value > 0.55 else None
+        if cur == prev:
+            return
+        if prev:
+            self._release(prev)
+        if cur:
+            self._press(cur, out)
+        self.axis_state[key] = cur
+
+    def handle(self, ev):
+        out = []
+        t = ev.type
+        if t == pygame.KEYDOWN and ev.key in self.KEYMAP:
+            self._press(self.KEYMAP[ev.key], out)
+        elif t == pygame.KEYUP and ev.key in self.KEYMAP:
+            self._release(self.KEYMAP[ev.key])
+        elif self.CBTN and t == pygame.CONTROLLERBUTTONDOWN and ev.button in self.CBTN:
+            self._press(self.CBTN[ev.button], out)
+        elif self.CBTN and t == pygame.CONTROLLERBUTTONUP and ev.button in self.CBTN:
+            self._release(self.CBTN[ev.button])
+        elif self.CBTN and t == pygame.CONTROLLERAXISMOTION and ev.axis in (0, 1):
+            v = ev.value / 32767.0
+            if ev.axis == 0:
+                self._axis(("c", ev.instance_id, 0), v, "left", "right", out)
+            else:
+                self._axis(("c", ev.instance_id, 1), v, "up", "down", out)
+        elif t in (pygame.JOYDEVICEADDED,):
+            self.add_device(ev.device_index)
+        elif t == pygame.JOYDEVICEREMOVED:
+            self.joysticks.pop(ev.instance_id, None)
+            self.controllers.pop(ev.instance_id, None)
+            self.ctrl_joy_ids.discard(ev.instance_id)
+        elif t in (pygame.JOYBUTTONDOWN, pygame.JOYBUTTONUP, pygame.JOYHATMOTION, pygame.JOYAXISMOTION):
+            if getattr(ev, "instance_id", None) in self.ctrl_joy_ids:
+                return out   # already handled as a controller event
+            if t == pygame.JOYBUTTONDOWN:
+                a = {0: "a", 1: "b", 2: "x", 3: "y", 4: "l", 5: "r", 6: "select", 7: "start"}.get(ev.button)
+                if a:
+                    self._press(a, out)
+            elif t == pygame.JOYBUTTONUP:
+                self.held = None
+            elif t == pygame.JOYHATMOTION:
+                x, y = ev.value
+                self.held = None
+                if y == 1:
+                    self._press("up", out)
+                elif y == -1:
+                    self._press("down", out)
+                elif x == -1:
+                    self._press("left", out)
+                elif x == 1:
+                    self._press("right", out)
+            elif t == pygame.JOYAXISMOTION and ev.axis in (0, 1):
+                if ev.axis == 0:
+                    self._axis(("j", ev.instance_id, 0), ev.value, "left", "right", out)
+                else:
+                    self._axis(("j", ev.instance_id, 1), ev.value, "up", "down", out)
+        return out
+
+    def repeat(self):
+        if self.held and time.time() >= self.next_repeat:
+            self.next_repeat = time.time() + 0.075
+            return [self.held]
+        return []
+
+    def reset(self):
+        self.held = None
+        self.axis_state.clear()
+
+
+class QuitWatcher(threading.Thread):
+    """While a game runs: hold Start + Select for a second to quit back to the dashboard."""
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.triggered = threading.Event()
+        self.stop = threading.Event()
+
+    def run(self):
+        try:
+            import evdev
+            from evdev import ecodes as e
+        except ImportError:
+            log("python3-evdev missing; Start+Select quit disabled")
+            return
+        devices, last_scan, since = [], 0, None
+        while not self.stop.is_set():
+            now = time.time()
+            if now - last_scan > 2:
+                last_scan = now
+                for d in devices:
+                    try:
+                        d.close()
+                    except Exception:
+                        pass
+                devices = []
+                for path in evdev.list_devices():
+                    try:
+                        d = evdev.InputDevice(path)
+                        keys = d.capabilities().get(e.EV_KEY, [])
+                        if e.BTN_START in keys and e.BTN_SELECT in keys:
+                            devices.append(d)
+                        else:
+                            d.close()
+                    except Exception:
+                        pass
+            combo = False
+            for d in devices:
+                try:
+                    k = set(d.active_keys())
+                except Exception:
+                    continue
+                if e.BTN_START in k and e.BTN_SELECT in k and not (k & {e.BTN_TL, e.BTN_TR}):
+                    combo = True
+            if combo:
+                since = since or now
+                if now - since >= 1.0:
+                    self.triggered.set()
+                    break
+            else:
+                since = None
+            time.sleep(0.05)
+        for d in devices:
+            try:
+                d.close()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------- audio -----
+def audio_sinks():
+    code, out = run(["pactl", "list", "short", "sinks"], 5)
+    sinks = []
+    if code == 0:
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                sinks.append(parts[1])
+    return sinks
+
+
+def sink_label(name):
+    n = name.lower()
+    if "hdmi" in n:
+        return "TV (HDMI 2)" if ("fef05700" in n or "hdmi1" in n) else "TV (HDMI)"
+    if "bluez" in n:
+        return "Bluetooth headset"
+    if "usb" in n:
+        return "USB audio"
+    if "headphone" in n or "bcm2835" in n or "analog" in n:
+        return "Headphone jack"
+    return name
+
+
+def current_sink():
+    code, out = run(["pactl", "get-default-sink"], 5)
+    return out.strip() if code == 0 else ""
+
+
+# ---------------------------------------------------------------- bluetooth -
+def bt(*args, timeout=15):
+    return run(["sudo", "-n", "bluetoothctl", *args], timeout)
+
+
+def bt_scan():
+    run(["sudo", "-n", "rfkill", "unblock", "bluetooth"], 5)
+    bt("power", "on")
+    bt("--timeout", "18", "scan", "on", timeout=25)
+    code, out = bt("devices")
+    found = []
+    for line in out.splitlines():
+        m = re.match(r"Device ([0-9A-F:]{17}) (.+)", line.strip())
+        if m and not re.fullmatch(r"[0-9A-F-]{17}", m.group(2)):
+            found.append((m.group(1), m.group(2)))
+    return found
+
+
+def bt_pair(mac):
+    bt("pair", mac, timeout=30)
+    bt("trust", mac)
+    code, out = bt("connect", mac, timeout=20)
+    return code == 0 and "successful" in out.lower()
+
+
+# ---------------------------------------------------------------- the app ---
+class App:
+    def __init__(self, screen):
+        self.screen = screen
+        self.clock = pygame.time.Clock()
+        self.state = State()
+        self.lib = scan_library()
+        self.input = Input()
+        self.fonts = {}
+        self.text_cache = {}
+        self.art_cache = {}
+        self.dirty = True
+        self.toast_text, self.toast_until, self.toast_sticky = "", 0, False
+        self.tint = SETTINGS_COLOR
+        self.ip = local_ip()
+        self.last_net_check = time.time()
+        self.usb_mtime = 0
+        self.confirm = None
+        self.bt_state = "idle"     # idle, scanning, list, pairing
+        self.bt_devices = []
+        self.bt_index = 0
+        self.mode = "home"         # home, games, settings, bluetooth
+        self.home_index = 0
+        self.list_index = 0
+        self.list_top = 0
+        self.letter_flash = ("", 0)
+        self.fetcher = ArtFetcher(self._art_ready)
+        self.fetcher.enabled = self.state.boxart
+        self.fetcher.start()
+        self.build_tiles()
+        self.check_usb(initial=True)
+
+    # ---------- fonts & text
+    def font(self, kind, size):
+        key = (kind, size)
+        if key not in self.fonts:
+            files = {"display": ["ArchivoBlack-Regular.ttf"],
+                     "bold": ["AtkinsonHyperlegible-Bold.ttf"],
+                     "body": ["AtkinsonHyperlegible-Regular.ttf"]}[kind]
+            f = None
+            for name in files:
+                p = FONT_DIR / name
+                if p.exists():
+                    try:
+                        f = pygame.font.Font(str(p), size)
+                        break
+                    except Exception:
+                        pass
+            if f is None:
+                f = pygame.font.SysFont("dejavusans", size, bold=(kind != "body"))
+            self.fonts[key] = f
+        return self.fonts[key]
+
+    def text(self, s, kind, size, color):
+        key = (s, kind, size, color)
+        surf = self.text_cache.get(key)
+        if surf is None:
+            if len(self.text_cache) > 600:
+                self.text_cache.clear()
+            surf = self.font(kind, size).render(s, True, color)
+            self.text_cache[key] = surf
+        return surf
+
+    def fit_text(self, s, kind, size, color, max_w, min_size=24):
+        while size > min_size:
+            surf = self.text(s, kind, size, color)
+            if surf.get_width() <= max_w:
+                return surf
+            size -= 6
+        surf = self.text(s, kind, min_size, color)
+        if surf.get_width() > max_w:
+            while len(s) > 3 and surf.get_width() > max_w:
+                s = s[:-2]
+                surf = self.text(s.rstrip() + "…", kind, min_size, color)
+        return surf
+
+    # ---------- data
+    def build_tiles(self):
+        tiles = []
+        if self.recent_games():
+            tiles.append(dict(kind="continue", tile="Continue", name="Continue playing",
+                              maker="Recently played", color=CONTINUE_COLOR))
+        if self.favorite_games():
+            tiles.append(dict(kind="favorites", tile="Favorites", name="Favorites",
+                              maker="Your picks", color=FAVORITES_COLOR))
+        for s in SYSTEMS:
+            if self.lib.get(s["id"]):
+                tiles.append(dict(kind="system", **s))
+        tiles.append(dict(kind="settings", tile="Settings", name="Settings",
+                          maker="RetroPi", color=SETTINGS_COLOR))
+        self.tiles = tiles
+        self.home_index = min(self.home_index, len(tiles) - 1)
+
+    def all_games(self):
+        return [g for games in self.lib.values() for g in games]
+
+    def recent_games(self):
+        by_path = {str(g.path): g for g in self.all_games()}
+        return [by_path[h["path"]] for h in self.state.history if h.get("path") in by_path][:20]
+
+    def favorite_games(self):
+        return sorted((g for g in self.all_games() if str(g.path) in self.state.favorites),
+                      key=lambda g: g.name.casefold())
+
+    def current_tile(self):
+        return self.tiles[self.home_index]
+
+    def current_list(self):
+        t = self.current_tile()
+        if t["kind"] == "continue":
+            return self.recent_games()
+        if t["kind"] == "favorites":
+            return self.favorite_games()
+        if t["kind"] == "system":
+            return self.lib.get(t["id"], [])
+        return []
+
+    def rescan(self, quiet=False):
+        tile_key = self.current_tile().get("id", self.current_tile()["kind"])
+        self.lib = scan_library()
+        self.build_tiles()
+        for i, t in enumerate(self.tiles):
+            if t.get("id", t["kind"]) == tile_key:
+                self.home_index = i
+        if self.mode == "games" and not self.current_list():
+            self.mode = "home"
+        n = len(self.all_games())
+        if not quiet:
+            self.toast(f"Found {n} game{'s' if n != 1 else ''}")
+        self.dirty = True
+
+    # ---------- feedback
+    def toast(self, msg, seconds=3.5, sticky=False):
+        self.toast_text, self.toast_until, self.toast_sticky = msg, time.time() + seconds, sticky
+        self.dirty = True
+
+    def _art_ready(self, game):
+        self.art_cache.pop(str(game.path), None)
+        self.dirty = True
+
+    def check_usb(self, initial=False):
+        try:
+            st = USB_STATUS.stat()
+        except OSError:
+            return
+        if st.st_mtime == self.usb_mtime:
+            return
+        self.usb_mtime = st.st_mtime
+        try:
+            d = json.loads(USB_STATUS.read_text())
+        except (OSError, ValueError):
+            return
+        if initial and d.get("state") != "copying":
+            return
+        state = d.get("state")
+        if state == "copying":
+            self.toast("Copying games from the USB stick. Leave it plugged in.", 3600, sticky=True)
+        elif state == "done":
+            added, unsorted = d.get("added", 0), d.get("unsorted", 0)
+            self.rescan(quiet=True)
+            if added == 0 and not unsorted:
+                msg = "No new games on the USB stick. Put them in a folder named roms."
+            else:
+                msg = f"Added {added} file{'s' if added != 1 else ''}. You can unplug the USB stick."
+                if unsorted:
+                    msg += f" {unsorted} need a system folder (see roms/unsorted)."
+            self.toast(msg, 8)
+        elif state == "error":
+            self.toast(d.get("message", "Couldn't read the USB stick."), 8)
+
+    # ---------- art
+    def art_for(self, game, box):
+        key = str(game.path)
+        if key in self.art_cache:
+            return self.art_cache[key]
+        p = art_path(game)
+        surf = None
+        if p:
+            try:
+                img = pygame.image.load(str(p)).convert_alpha()
+                iw, ih = img.get_size()
+                scale = min(box[0] / iw, box[1] / ih)
+                surf = pygame.transform.smoothscale(img, (max(1, int(iw * scale)), max(1, int(ih * scale))))
+            except Exception:
+                surf = None
+        if len(self.art_cache) > 60:
+            self.art_cache.clear()
+        self.art_cache[key] = surf
+        return surf
+
+    # ---------- launching
+    def launch(self, game):
+        sysd = SYS_BY_ID[game.system]
+        core = CORES / f"{sysd['core']}_libretro.so"
+        if not core.exists():
+            self.toast(f"The {sysd['name']} emulator is missing. Rebuild the image to add it.", 6)
+            return
+        self.draw_loading(game)
+        env = dict(os.environ)
+        env.setdefault("MESA_GL_VERSION_OVERRIDE", "3.3")
+        env.setdefault("MESA_GLSL_VERSION_OVERRIDE", "330")
+        env.pop("SDL_VIDEODRIVER", None)
+        LOGDIR.mkdir(parents=True, exist_ok=True)
+        logf = open(LOGDIR / "retroarch.log", "w")
+        log(f"launch {game.path} with {core.name}")
+        try:
+            proc = subprocess.Popen(["retroarch", "-f", "-L", str(core), str(game.path)],
+                                    stdout=logf, stderr=subprocess.STDOUT, env=env)
+        except OSError as e:
+            logf.close()
+            self.toast(f"Couldn't start RetroArch: {e}", 6)
+            return
+        started = time.time()
+        watcher = QuitWatcher()
+        watcher.start()
+        while proc.poll() is None:
+            pygame.event.pump()
+            if watcher.triggered.is_set():
+                proc.terminate()
+                try:
+                    proc.wait(8)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                break
+            time.sleep(0.05)
+        watcher.stop.set()
+        logf.close()
+        pygame.event.clear()
+        self.input.reset()
+        self.state.played(game)
+        if time.time() - started < 3 and proc.returncode not in (0, None, -15):
+            self.toast("That game didn't start. The file may be damaged or need a BIOS.", 7)
+        self.build_tiles()
+        self.dirty = True
+
+    # ---------- actions
+    def handle(self, action):
+        self.dirty = True
+        if self.confirm and action != "a":
+            self.confirm = None
+        getattr(self, f"handle_{self.mode}")(action)
+
+    def handle_home(self, a):
+        n = len(self.tiles)
+        if a in ("right", "down"):
+            self.home_index = (self.home_index + 1) % n
+        elif a in ("left", "up"):
+            self.home_index = (self.home_index - 1) % n
+        elif a == "a":
+            t = self.current_tile()
+            if t["kind"] == "settings":
+                self.mode, self.list_index, self.list_top = "settings", 0, 0
+            else:
+                games = self.current_list()
+                if games:
+                    self.mode, self.list_index, self.list_top = "games", 0, 0
+                    if self.state.boxart:
+                        self.fetcher.want(games)
+        elif a == "start":
+            self.home_index = n - 1
+
+    def handle_games(self, a):
+        games = self.current_list()
+        if not games:
+            self.mode = "home"
+            return
+        n = len(games)
+        i = self.list_index
+        if a == "down":
+            i = (i + 1) % n
+        elif a == "up":
+            i = (i - 1) % n
+        elif a == "right":
+            i = min(n - 1, i + 10)
+        elif a == "left":
+            i = max(0, i - 10)
+        elif a in ("l", "r"):
+            letters = [g.name[:1].upper() for g in games]
+            cur = letters[i]
+            if a == "r":
+                j = next((k for k in range(i + 1, n) if letters[k] != cur), i)
+            else:
+                start = next((k for k in range(i, -1, -1) if letters[k] != cur), None)
+                if start is None:
+                    j = 0
+                else:
+                    target = letters[start]
+                    j = start
+                    while j > 0 and letters[j - 1] == target:
+                        j -= 1
+            i = j
+            self.letter_flash = (games[i].name[:1].upper(), time.time() + 0.7)
+        elif a == "a":
+            self.launch(games[i])
+            return
+        elif a == "y":
+            p = str(games[i].path)
+            if p in self.state.favorites:
+                self.state.favorites.discard(p)
+                self.toast(f"Removed {games[i].name} from favorites", 2)
+            else:
+                self.state.favorites.add(p)
+                self.toast(f"Added {games[i].name} to favorites", 2)
+            self.state.save()
+            before = (self.current_tile()["kind"], self.current_tile().get("id"))
+            self.build_tiles()
+            match = [k for k, t in enumerate(self.tiles) if (t["kind"], t.get("id")) == before]
+            if match:
+                self.home_index = match[0]
+                i = min(i, max(0, len(self.current_list()) - 1))
+            else:   # the favorites list just became empty
+                self.home_index = 0
+                self.mode = "home"
+                return
+        elif a == "b":
+            self.mode = "home"
+            return
+        self.list_index = i
+
+    def settings_items(self):
+        sink = current_sink()
+        items = [
+            ("sound", "Sound output", sink_label(sink) if sink else "No sound device"),
+            ("bluetooth", "Pair a Bluetooth controller", ""),
+            ("boxart", "Download box art", "On" if self.state.boxart else "Off"),
+            ("rescan", "Look for new games", ""),
+            ("network", "Network", self.ip or "Not connected"),
+            ("share", "Add games over the network", SHARE_NAME),
+            ("reboot", "Restart", ""),
+            ("poweroff", "Shut down", ""),
+        ]
+        return items
+
+    def handle_settings(self, a):
+        items = self.settings_items()
+        n = len(items)
+        if a == "down":
+            self.list_index = (self.list_index + 1) % n
+        elif a == "up":
+            self.list_index = (self.list_index - 1) % n
+        elif a == "b":
+            self.mode = "home"
+        elif a == "a":
+            key = items[self.list_index][0]
+            if key == "sound":
+                sinks = audio_sinks()
+                if not sinks:
+                    self.toast("No sound devices found. Check the TV or speaker is connected.", 5)
+                    return
+                cur = current_sink()
+                nxt = sinks[(sinks.index(cur) + 1) % len(sinks)] if cur in sinks else sinks[0]
+                run(["pactl", "set-default-sink", nxt], 5)
+                try:
+                    CONF.mkdir(parents=True, exist_ok=True)
+                    (CONF / "audio-sink").write_text(nxt)
+                except OSError:
+                    pass
+                self.toast(f"Sound now plays through {sink_label(nxt)}", 2.5)
+            elif key == "bluetooth":
+                self.mode, self.bt_state, self.bt_devices, self.bt_index = "bluetooth", "scanning", [], 0
+                threading.Thread(target=self._bt_scan, daemon=True).start()
+            elif key == "boxart":
+                self.state.boxart = not self.state.boxart
+                self.fetcher.enabled = self.state.boxart
+                self.state.save()
+            elif key == "rescan":
+                self.fetcher.forget_missing()
+                self.rescan()
+            elif key == "network":
+                if self.ip:
+                    self.toast(f"Connected. This console is at {self.ip}", 5)
+                else:
+                    self.toast("Not connected. Plug in a network cable, or fill in retro-wifi.txt on the SD card.", 8)
+            elif key == "share":
+                self.toast(f"Open {SHARE_NAME} on your computer. User retro, password retro.", 8)
+            elif key in ("reboot", "poweroff"):
+                if self.confirm == key:
+                    self.draw_message("Restarting…" if key == "reboot" else "Shutting down…")
+                    run(["sudo", "-n", "systemctl", key], 10)
+                else:
+                    self.confirm = key
+                    self.toast(f"Press A again to {'restart' if key == 'reboot' else 'shut down'}", 3)
+
+    def _bt_scan(self):
+        found = bt_scan()
+        self.bt_devices = found
+        self.bt_state = "list"
+        self.dirty = True
+
+    def _bt_pair(self, mac, name):
+        ok = bt_pair(mac)
+        self.bt_state = "list"
+        self.toast(f"{name} is connected" if ok else
+                   f"Couldn't pair {name}. Put it in pairing mode and try again.", 5)
+
+    def handle_bluetooth(self, a):
+        if a == "b" and self.bt_state != "pairing":
+            self.mode = "settings"
+            return
+        if self.bt_state != "list":
+            return
+        n = len(self.bt_devices) + 1    # last row = search again
+        if a == "down":
+            self.bt_index = (self.bt_index + 1) % n
+        elif a == "up":
+            self.bt_index = (self.bt_index - 1) % n
+        elif a == "a":
+            if self.bt_index == len(self.bt_devices):
+                self.bt_state, self.bt_devices, self.bt_index = "scanning", [], 0
+                threading.Thread(target=self._bt_scan, daemon=True).start()
+            else:
+                mac, name = self.bt_devices[self.bt_index]
+                self.bt_state = "pairing"
+                self.toast(f"Pairing {name}…", 30)
+                threading.Thread(target=self._bt_pair, args=(mac, name), daemon=True).start()
+
+    # ---------- drawing
+    def target_tint(self):
+        return self.current_tile()["color"]
+
+    def draw(self):
+        s = self.screen
+        bg = mix(BASE, self.tint, 0.2)
+        s.fill(bg)
+        getattr(self, f"draw_{self.mode}")(s, bg)
+        self.draw_status(s, bg)
+        self.draw_toast(s)
+
+    def draw_status(self, s, bg):
+        dim = mix(INK, bg, 0.45)
+        clock = self.text(time.strftime("%H:%M"), "bold", 26, INK)
+        s.blit(clock, (W - 64 - clock.get_width(), 34))
+        net = "Online" if self.ip else "Offline"
+        pads = self.input.count
+        info = f"{net}    {pads} controller{'s' if pads != 1 else ''}" if pads else f"{net}    No controller"
+        t = self.text(info, "body", 20, dim)
+        s.blit(t, (W - 64 - clock.get_width() - 28 - t.get_width(), 39))
+
+    def hints(self, s, items, bg):
+        x, y = 80, H - 58
+        for btn, label in items:
+            if btn == "<>":   # left/right arrows, drawn so no font glyph is needed
+                cw = 46
+                pygame.draw.rect(s, INK, (x, y, cw, 30), border_radius=15)
+                cy = y + 15
+                pygame.draw.polygon(s, bg, [(x + 11, cy), (x + 19, cy - 6), (x + 19, cy + 6)])
+                pygame.draw.polygon(s, bg, [(x + 35, cy), (x + 27, cy - 6), (x + 27, cy + 6)])
+            else:
+                chip = self.text(btn, "bold", 18, bg)
+                cw = max(30, chip.get_width() + 16)
+                pygame.draw.rect(s, INK, (x, y, cw, 30), border_radius=15)
+                s.blit(chip, (x + (cw - chip.get_width()) // 2, y + (30 - chip.get_height()) // 2))
+            lab = self.text(label, "body", 21, mix(INK, bg, 0.25))
+            s.blit(lab, (x + cw + 10, y + (30 - lab.get_height()) // 2))
+            x += cw + 10 + lab.get_width() + 34
+
+    def draw_home(self, s, bg):
+        t = self.current_tile()
+        col = t["color"]
+        light = mix(col, INK, 0.55)
+        no_games = not self.all_games()
+
+        if no_games and t["kind"] == "settings" and len(self.tiles) == 1:
+            s.blit(self.text("Let's add some games", "display", 64, INK), (76, 150))
+            self._draw_empty(s, bg, col)
+            self.hints(s, [("A", "Open settings")], bg)
+            return
+        self._draw_header(s, bg, t, col, light)
+        self._draw_strip(s, bg, t)
+
+    def _draw_empty(self, s, bg, col):
+        lines = [
+            ("1", "On a USB stick, make a folder named roms and put your games in it."),
+            ("2", "Plug the stick into the console. Games are sorted and added for you."),
+        ]
+        y = 270
+        for num, line in lines:
+            pygame.draw.circle(s, col, (96, y + 16), 17)
+            n = self.text(num, "bold", 22, on_color(col))
+            s.blit(n, (96 - n.get_width() // 2, y + 16 - n.get_height() // 2))
+            s.blit(self.text(line, "body", 27, INK), (130, y))
+            y += 56
+        s.blit(self.text(f"Or copy them over your network to {SHARE_NAME}", "body", 24,
+                         mix(INK, bg, 0.35)), (130, y + 10))
+        s.blit(self.text("User retro, password retro.", "body", 24,
+                         mix(INK, bg, 0.35)), (130, y + 44))
+
+    def _draw_header(self, s, bg, t, col, light):
+        s.blit(self.text(t["maker"], "bold", 28, light), (80, 168))
+        name = self.fit_text(t["name"], "display", 112, INK, W - 160, 48)
+        s.blit(name, (76, 204))
+        y = 204 + name.get_height() + 6
+        sub = self.tile_subtitle(t)
+        if sub:
+            s.blit(self.text(sub, "body", 28, mix(INK, bg, 0.3)), (80, y))
+
+    def _draw_strip(self, s, bg, t):
+        tw, th, gap = 132, 104, 14
+        sel_w, sel_h = 168, 132
+        total = len(self.tiles) * (tw + gap) + (sel_w - tw)
+        x0 = 80
+        sel_x = x0 + self.home_index * (tw + gap)
+        if total > W - 160:
+            offset = max(0, min(sel_x - (W // 2 - sel_w // 2), total - (W - 160)))
+            x0 -= offset
+        x = x0
+        base_y = 470
+        for i, tile in enumerate(self.tiles):
+            c = tile["color"]
+            if i == self.home_index:
+                r = pygame.Rect(x, base_y - (sel_h - th), sel_w, sel_h)
+                pygame.draw.rect(s, c, r, border_radius=18)
+                lab = self.fit_text(tile["tile"], "display", 34, on_color(c), sel_w - 20, 18)
+                s.blit(lab, (r.x + 16, r.bottom - lab.get_height() - 12))
+                x += sel_w + gap
+            else:
+                r = pygame.Rect(x, base_y, tw, th)
+                if -tw < x < W:
+                    pygame.draw.rect(s, mix(bg, c, 0.35), r, border_radius=14)
+                    lab = self.fit_text(tile["tile"], "display", 24, mix(INK, c, 0.25), tw - 20, 14)
+                    s.blit(lab, (r.x + 14, r.bottom - lab.get_height() - 10))
+                x += tw + gap
+
+        if t["kind"] == "settings":
+            self.hints(s, [("A", "Open settings")], bg)
+        else:
+            self.hints(s, [("A", "Browse games"), ("<>", "Change system")], bg)
+
+    def tile_subtitle(self, t):
+        if t["kind"] == "system":
+            n = len(self.lib.get(t["id"], []))
+            return f"{n} game{'s' if n != 1 else ''}"
+        if t["kind"] == "continue":
+            g = self.recent_games()
+            if g:
+                ts = self.state.last_played(g[0])
+                return f"{g[0].name}, {ago(ts)}" if ts else g[0].name
+        if t["kind"] == "favorites":
+            n = len(self.favorite_games())
+            return f"{n} game{'s' if n != 1 else ''}"
+        if t["kind"] == "settings":
+            return "Sound, controllers and network"
+        return ""
+
+    def draw_list_rows(self, s, rows, col, bg, x, y, w, row_h=46, visible=11):
+        n = len(rows)
+        if self.list_index < self.list_top + 2:
+            self.list_top = max(0, self.list_index - 2)
+        if self.list_index > self.list_top + visible - 3:
+            self.list_top = min(max(0, n - visible), self.list_index - visible + 3)
+        self.list_top = max(0, min(self.list_top, max(0, n - visible)))
+        for k in range(self.list_top, min(n, self.list_top + visible)):
+            label, value, star = rows[k]
+            ry = y + (k - self.list_top) * row_h
+            selected = k == self.list_index
+            tc = on_color(col) if selected else INK
+            if selected:
+                pygame.draw.rect(s, col, (x - 18, ry, w + 36, row_h - 4), border_radius=12)
+            lx = x
+            if star:
+                draw_star(s, (x + 9, ry + (row_h - 4) // 2), 9, tc if selected else FAVORITES_COLOR)
+                lx += 28
+            vs = self.text(value, "body", 23, tc if selected else mix(INK, bg, 0.4)) if value else None
+            maxw = w - (lx - x) - (vs.get_width() + 24 if vs else 0)
+            ls = self.fit_text(label, "bold" if selected else "body", 27, tc, maxw, 27)
+            s.blit(ls, (lx, ry + (row_h - 4 - ls.get_height()) // 2))
+            if vs:
+                s.blit(vs, (x + w - vs.get_width(), ry + (row_h - 4 - vs.get_height()) // 2))
+        if n > visible:   # scroll bar
+            track = visible * row_h - 4
+            bar_h = max(30, int(track * visible / n))
+            bar_y = y + int((track - bar_h) * self.list_top / max(1, n - visible))
+            pygame.draw.rect(s, mix(bg, INK, 0.12), (x + w + 30, y, 4, track), border_radius=2)
+            pygame.draw.rect(s, mix(INK, col, 0.3), (x + w + 30, bar_y, 4, bar_h), border_radius=2)
+
+    def draw_games(self, s, bg):
+        t = self.current_tile()
+        col = t["color"]
+        games = self.current_list()
+        if not games:
+            return
+        self.list_index = min(self.list_index, len(games) - 1)
+        head = self.fit_text(t["name"], "display", 48, INK, 620, 28)
+        s.blit(head, (80, 40))
+        cnt = self.text(f"{self.list_index + 1} of {len(games)}", "body", 22, mix(INK, bg, 0.4))
+        s.blit(cnt, (80, 40 + head.get_height() + 2))
+        mixed = t["kind"] in ("continue", "favorites")
+        rows = [(g.name, SYS_BY_ID[g.system]["tile"] if mixed else "", str(g.path) in self.state.favorites)
+                for g in games]
+        self.draw_list_rows(s, rows, col, bg, 98, 140, 640)
+
+        g = games[self.list_index]
+        gc = SYS_BY_ID[g.system]["color"]
+        box = pygame.Rect(830, 140, 370, 440)
+        art = self.art_for(g, box.size)
+        if art:
+            s.blit(art, (box.centerx - art.get_width() // 2, box.y + (box.h - art.get_height()) // 2))
+        else:
+            pygame.draw.rect(s, mix(bg, gc, 0.55), box, border_radius=18)
+            letter = self.text(g.name[:1].upper() or "?", "display", 200, mix(gc, INK, 0.65))
+            s.blit(letter, (box.centerx - letter.get_width() // 2, box.centery - letter.get_height() // 2))
+        ts = self.state.last_played(g)
+        info = f"Played {ago(ts)}" if ts else "Not played yet"
+        it = self.text(info, "body", 22, mix(INK, bg, 0.4))
+        s.blit(it, (box.centerx - it.get_width() // 2, box.bottom + 14))
+
+        letter, until = self.letter_flash
+        if letter and time.time() < until:
+            r = pygame.Rect(0, 0, 150, 150)
+            r.center = (W // 2 - 140, H // 2)
+            pygame.draw.rect(s, col, r, border_radius=24)
+            lt = self.text(letter, "display", 96, on_color(col))
+            s.blit(lt, (r.centerx - lt.get_width() // 2, r.centery - lt.get_height() // 2))
+            self.dirty = True
+
+        fav = "Unfavorite" if str(g.path) in self.state.favorites else "Favorite"
+        self.hints(s, [("A", "Play"), ("B", "Back"), ("Y", fav), ("L R", "Jump by letter")], bg)
+
+    def draw_settings(self, s, bg):
+        col = SETTINGS_COLOR
+        s.blit(self.text("Settings", "display", 48, INK), (80, 40))
+        rows = [(label, value, False) for _, label, value in self.settings_items()]
+        self.list_index = min(self.list_index, len(rows) - 1)
+        self.draw_list_rows(s, rows, mix(col, INK, 0.25), bg, 98, 140, 900, visible=10)
+        self.hints(s, [("A", "Select"), ("B", "Back")], bg)
+
+    def draw_bluetooth(self, s, bg):
+        col = mix(SETTINGS_COLOR, INK, 0.25)
+        s.blit(self.text("Pair a controller", "display", 48, INK), (80, 40))
+        dim = mix(INK, bg, 0.35)
+        if self.bt_state == "scanning":
+            dots = "." * (1 + int(time.time() * 2) % 3)
+            s.blit(self.text(f"Looking for controllers{dots}", "bold", 30, INK), (80, 150))
+            s.blit(self.text("Put your controller in pairing mode now. This takes about 20 seconds.",
+                             "body", 24, dim), (80, 196))
+            self.dirty = True
+            self.hints(s, [("B", "Cancel")], bg)
+            return
+        rows = [(name, mac, False) for mac, name in self.bt_devices] + [("Search again", "", False)]
+        self.list_index = self.bt_index
+        self.draw_list_rows(s, rows, col, bg, 98, 140, 900, visible=10)
+        if not self.bt_devices:
+            s.blit(self.text("No controllers found. Check it's in pairing mode, then search again.",
+                             "body", 24, dim), (98, 200))
+        self.hints(s, [("A", "Pair"), ("B", "Back")], bg)
+
+    def draw_toast(self, s):
+        if not self.toast_text:
+            return
+        if time.time() > self.toast_until:
+            self.toast_text = ""
+            self.dirty = True
+            return
+        t = self.text(self.toast_text, "bold", 24, (18, 16, 20))
+        r = pygame.Rect(0, 0, min(W - 120, t.get_width() + 56), 58)
+        r.midbottom = (W // 2, H - 104)
+        pygame.draw.rect(s, INK, r, border_radius=29)
+        if t.get_width() > r.w - 56:
+            t = self.fit_text(self.toast_text, "bold", 24, (18, 16, 20), r.w - 56, 16)
+        s.blit(t, (r.centerx - t.get_width() // 2, r.centery - t.get_height() // 2))
+
+    def draw_message(self, msg, sub=""):
+        bg = mix(BASE, self.tint, 0.2)
+        self.screen.fill(bg)
+        t = self.fit_text(msg, "display", 64, INK, W - 160, 28)
+        self.screen.blit(t, (80, H // 2 - 60))
+        if sub:
+            self.screen.blit(self.text(sub, "body", 26, mix(INK, bg, 0.3)), (82, H // 2 + 30))
+        pygame.display.flip()
+
+    def draw_loading(self, game):
+        self.draw_message(game.name, "Hold Start + Select for a second to come back here.")
+
+    # ---------- main loop
+    def tick_background(self):
+        now = time.time()
+        if now - self.last_net_check > 5:
+            self.last_net_check = now
+            ip = local_ip()
+            if ip != self.ip:
+                self.ip = ip
+                self.dirty = True
+        self.check_usb()
+        if int(now) % 60 == 0:
+            self.dirty = True   # clock
+
+    def loop(self):
+        last_minute = time.strftime("%H:%M")
+        while True:
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    return
+                if ev.type == pygame.KEYDOWN and ev.key == pygame.K_q and ev.mod & pygame.KMOD_CTRL:
+                    return
+                if ev.type in (pygame.WINDOWEXPOSED, pygame.VIDEOEXPOSE, pygame.WINDOWSHOWN):
+                    self.dirty = True
+                for a in self.input.handle(ev):
+                    self.handle(a)
+                if ev.type in (pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED):
+                    self.dirty = True
+            for a in self.input.repeat():
+                self.handle(a)
+            self.tick_background()
+            minute = time.strftime("%H:%M")
+            if minute != last_minute:
+                last_minute = minute
+                self.dirty = True
+            target = self.target_tint()
+            if self.mode == "settings" or self.mode == "bluetooth":
+                target = SETTINGS_COLOR
+            if self.tint != target:
+                self.tint = mix(self.tint, target, 0.22)
+                if max(abs(self.tint[i] - target[i]) for i in range(3)) < 3:
+                    self.tint = target
+                self.dirty = True
+            if self.dirty:
+                self.dirty = False
+                self.draw()
+                pygame.display.flip()
+                self.clock.tick(60)
+            else:
+                self.clock.tick(30)
+
+
+def draw_star(s, center, r, color):
+    import math
+    cx, cy = center
+    pts = []
+    for k in range(10):
+        ang = -math.pi / 2 + k * math.pi / 5
+        rr = r if k % 2 == 0 else r * 0.45
+        pts.append((cx + rr * math.cos(ang), cy + rr * math.sin(ang)))
+    pygame.draw.polygon(s, color, pts)
+
+
+def main():
+    pygame.init()
+    pygame.mouse.set_visible(False)
+    flags = pygame.FULLSCREEN | pygame.SCALED
+    try:
+        screen = pygame.display.set_mode((W, H), flags, vsync=1)
+    except pygame.error:
+        screen = pygame.display.set_mode((W, H), flags)
+    pygame.display.set_caption("RetroPi")
+    try:
+        App(screen).loop()
+    except Exception:
+        import traceback
+        log("crash:\n" + traceback.format_exc())
+        raise
+    finally:
+        pygame.quit()
+
+
+if __name__ == "__main__":
+    main()

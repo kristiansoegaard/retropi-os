@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Started on tty1 after auto-login. Shows the RetroPi dashboard full screen
+# and brings it back if it ever closes.
+LOG="$HOME/.cache/retro/session.log"
+mkdir -p "$(dirname "$LOG")"
+echo "=== session start $(date) ===" >> "$LOG"
+
+# Sound: use the output picked in Settings, otherwise the TV (HDMI)
+for _ in $(seq 1 40); do pactl info >/dev/null 2>&1 && break; sleep 0.25; done
+want="$(cat "$HOME/.config/retro-os/audio-sink" 2>/dev/null)"
+sinks="$(pactl list short sinks 2>/dev/null | awk '{print $2}')"
+if [[ -n "$want" ]] && grep -qxF "$want" <<<"$sinks"; then
+  pactl set-default-sink "$want" >> "$LOG" 2>&1
+else
+  hdmi="$(grep -i -m1 hdmi <<<"$sinks")"
+  [[ -n "$hdmi" ]] && pactl set-default-sink "$hdmi" >> "$LOG" 2>&1
+fi
+
+CAGE_OPTS=()
+cage -h 2>&1 | grep -qE '^[[:space:]]*-s' && CAGE_OPTS+=(-s)
+
+fails=0
+while [[ ! -f "$HOME/.retro-noauto" ]]; do
+  start=$(date +%s)
+  if (( fails < 3 )); then
+    cage "${CAGE_OPTS[@]}" -- /usr/local/bin/retro-dashboard >> "$LOG" 2>&1
+  else
+    # Safety net: if the dashboard keeps failing, RetroArch's own menu still lets you play.
+    echo "dashboard failed repeatedly; starting RetroArch menu" >> "$LOG"
+    cage "${CAGE_OPTS[@]}" -- retroarch >> "$LOG" 2>&1
+    fails=0
+  fi
+  if (( $(date +%s) - start < 15 )); then fails=$((fails + 1)); else fails=0; fi
+  sleep 1
+done

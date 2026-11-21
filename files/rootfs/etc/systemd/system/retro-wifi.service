@@ -1,0 +1,13 @@
+[Unit]
+Description=RetroPi: apply Wi-Fi settings from retro-wifi.txt
+After=NetworkManager.service
+Wants=NetworkManager.service
+Before=getty@tty1.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/retro-wifi-setup
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

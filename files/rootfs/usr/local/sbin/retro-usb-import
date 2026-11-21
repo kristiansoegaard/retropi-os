@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# Copies games from a USB stick into the console. Started by udev when a USB
+# drive is plugged in. Looks for folders named roms and bios on the stick.
+# Loose game files in roms/ are sorted into the right system by file type.
+set -u
+DEV="/dev/$1"
+RUSER=retro
+RETRO="/home/$RUSER/retro"
+STATUS_DIR=/run/retro-os
+MNT="/run/retro-usb/$1"
+mkdir -p "$STATUS_DIR" "$MNT"
+chmod 755 "$STATUS_DIR"
+
+status() {   # status <json>
+  printf '%s\n' "$1" > "$STATUS_DIR/usb.json.tmp" && mv "$STATUS_DIR/usb.json.tmp" "$STATUS_DIR/usb.json"
+  chmod 644 "$STATUS_DIR/usb.json"
+}
+
+mount -o ro "$DEV" "$MNT" 2>/dev/null || mount -t ntfs3 -o ro "$DEV" "$MNT" 2>/dev/null || {
+  rmdir "$MNT" 2>/dev/null; exit 0; }   # not a filesystem we can read; ignore quietly
+
+cleanup() { sync; umount "$MNT" 2>/dev/null; rmdir "$MNT" 2>/dev/null; }
+trap cleanup EXIT
+
+# Find roms/ and bios/ folders (any capitalisation) at the top of the stick
+SRC_ROMS="$(find "$MNT" -maxdepth 1 -type d -iname roms | head -1)"
+SRC_BIOS="$(find "$MNT" -maxdepth 1 -type d -iname bios | head -1)"
+[[ -z "$SRC_ROMS" && -z "$SRC_BIOS" ]] && exit 0   # just a normal USB stick
+
+status '{"state":"copying"}'
+added=0; unsorted=0
+
+copy_file() {   # copy_file <src> <dest_dir>  (never overwrites)
+  local dest
+  dest="$2/$(basename "$1")"
+  mkdir -p "$2"
+  if [[ ! -e "$dest" ]]; then
+    cp "$1" "$dest" && added=$((added + 1))
+  fi
+}
+
+system_for() {  # unambiguous file types only
+  case "${1,,}" in
+    *.nes|*.fds|*.unf|*.unif) echo nes ;;
+    *.sfc|*.smc|*.swc|*.fig|*.bs) echo snes ;;
+    *.gb) echo gb ;;  *.gbc) echo gbc ;;  *.gba) echo gba ;;
+    *.n64|*.z64|*.v64) echo n64 ;;
+    *.md|*.gen|*.smd) echo megadrive ;;
+    *.sms) echo mastersystem ;;  *.gg) echo gamegear ;;
+    *.chd|*.pbp) echo psx ;;
+    *.pce) echo pcengine ;;  *.a26) echo atari2600 ;;
+    *) echo "" ;;
+  esac
+}
+
+if [[ -n "$SRC_ROMS" ]]; then
+  # System folders on the stick (roms/snes, roms/psx, ...) are copied as they are
+  while IFS= read -r -d '' sub; do
+    name="$(basename "$sub")"; name="${name,,}"
+    case "$name" in
+      genesis) name=megadrive ;; ps1|playstation) name=psx ;; mame|fbneo|fba) name=arcade ;;
+      tg16|turbografx16) name=pcengine ;; sms) name=mastersystem ;;
+    esac
+    while IFS= read -r -d '' f; do
+      rel="${f#"$sub"/}"
+      copy_file "$f" "$RETRO/roms/$name/$(dirname "$rel")"
+    done < <(find "$sub" -type f ! -name '.*' -print0)
+  done < <(find "$SRC_ROMS" -mindepth 1 -maxdepth 1 -type d -print0)
+
+  # Loose files directly in roms/ are sorted by type
+  while IFS= read -r -d '' f; do
+    sys="$(system_for "$f")"
+    if [[ -n "$sys" ]]; then
+      copy_file "$f" "$RETRO/roms/$sys"
+    else
+      before=$added
+      copy_file "$f" "$RETRO/roms/unsorted"
+      if (( added > before )); then unsorted=$((unsorted + 1)); added=$((added - 1)); fi
+    fi
+  done < <(find "$SRC_ROMS" -mindepth 1 -maxdepth 1 -type f ! -name '.*' -print0)
+fi
+
+if [[ -n "$SRC_BIOS" ]]; then
+  while IFS= read -r -d '' f; do
+    rel="${f#"$SRC_BIOS"/}"
+    copy_file "$f" "$RETRO/bios/$(dirname "$rel")"
+  done < <(find "$SRC_BIOS" -type f ! -name '.*' -print0)
+fi
+
+chown -R "$RUSER:$RUSER" "$RETRO"
+status "{\"state\":\"done\",\"added\":$added,\"unsorted\":$unsorted}"

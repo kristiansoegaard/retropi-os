@@ -1,0 +1,7 @@
+# RetroPi Wi-Fi setup
+# Type your Wi-Fi name and password after the = signs, save this file,
+# and put the SD card in the console. (Using a network cable? Skip this.)
+SSID=
+PASSWORD=
+COUNTRY=DK
+TIMEZONE=Europe/Copenhagen
