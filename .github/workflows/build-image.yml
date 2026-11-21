@@ -1,0 +1,46 @@
+name: Build RetroPi OS image
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Build machine. ARM is much faster but needs a public repository."
+        type: choice
+        options:
+          - ubuntu-24.04-arm
+          - ubuntu-24.04
+        default: ubuntu-24.04-arm
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 150
+    steps:
+      - name: Get the files
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static binfmt-support parted e2fsprogs xz-utils curl
+
+      - name: Build the image
+        run: sudo bash build/build-image.sh
+
+      - name: Publish the image as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="retropi-$(date +%Y-%m-%d)-run${{ github.run_number }}"
+          base="$(cat out/base-image.txt)"
+          cat > notes.md <<NOTES
+          Flash **retropi-os.img.xz** with Raspberry Pi Imager:
+          Choose OS > Use custom > pick this file. When Imager asks about OS customisation, choose **No**.
+
+          Built from \`${base}\`.
+          NOTES
+          gh release create "$tag" out/retropi-os.img.xz out/retropi-os.img.xz.sha256 \
+            --title "RetroPi OS $(date +%Y-%m-%d)" --notes-file notes.md
