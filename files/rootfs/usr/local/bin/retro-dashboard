@@ -1252,6 +1252,14 @@ class App:
 
     def loop(self):
         last_minute = time.strftime("%H:%M")
+        self.draw()
+        pygame.display.flip()
+        try:   # tells retro-session that a picture is on screen
+            LOGDIR.mkdir(parents=True, exist_ok=True)
+            (LOGDIR / "dashboard.alive").write_text(str(time.time()))
+        except OSError:
+            pass
+        log("dashboard running")
         while True:
             for ev in pygame.event.get():
                 if ev.type == pygame.QUIT:

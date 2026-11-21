@@ -1,0 +1,6 @@
+[Unit]
+Description=RetroPi: copy logs to the SD card boot drive
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/retro-diag --timer

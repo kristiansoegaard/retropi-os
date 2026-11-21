@@ -1,35 +1,94 @@
 #!/usr/bin/env bash
-# Started on tty1 after auto-login. Shows the RetroPi dashboard full screen
-# and brings it back if it ever closes.
-LOG="$HOME/.cache/retro/session.log"
-mkdir -p "$(dirname "$LOG")"
-echo "=== session start $(date) ===" >> "$LOG"
+# Started on tty1 after auto-login. Shows the RetroPi dashboard full screen.
+# If no picture appears, it gives up after a few tries so the keyboard works,
+# and the log is copied to retro-logs.txt on the SD card (see retro-diag).
+LOGDIR="$HOME/.cache/retro"
+LOG="$LOGDIR/session.log"
+ALIVE="$LOGDIR/dashboard.alive"
+mkdir -p "$LOGDIR"
+exec 3>>"$LOG"
+log() { echo "$(date '+%F %T') $*" >&3; }
+log "=== session start on $(tty)"
 
-# Sound: use the output picked in Settings, otherwise the TV (HDMI)
-for _ in $(seq 1 40); do pactl info >/dev/null 2>&1 && break; sleep 0.25; done
-want="$(cat "$HOME/.config/retro-os/audio-sink" 2>/dev/null)"
-sinks="$(pactl list short sinks 2>/dev/null | awk '{print $2}')"
-if [[ -n "$want" ]] && grep -qxF "$want" <<<"$sinks"; then
-  pactl set-default-sink "$want" >> "$LOG" 2>&1
-else
-  hdmi="$(grep -i -m1 hdmi <<<"$sinks")"
-  [[ -n "$hdmi" ]] && pactl set-default-sink "$hdmi" >> "$LOG" 2>&1
+BOOT=/boot/firmware; [[ -d $BOOT ]] || BOOT=/boot
+if [[ -f "$BOOT/retro-safe-mode.txt" ]]; then
+  log "safe mode file found; not starting the dashboard"
+  echo "RetroPi safe mode (retro-safe-mode.txt is on the SD card). Log in here."
+  exit 0
 fi
 
+# Sound: the output picked in Settings, otherwise the TV (HDMI)
+for _ in $(seq 1 20); do timeout 3 pactl info >/dev/null 2>&1 && break; sleep 0.5; done
+want="$(cat "$HOME/.config/retro-os/audio-sink" 2>/dev/null)"
+sinks="$(timeout 3 pactl list short sinks 2>/dev/null | awk '{print $2}')"
+if [[ -n "$want" ]] && grep -qxF "$want" <<<"$sinks"; then
+  timeout 3 pactl set-default-sink "$want" >&3 2>&1
+else
+  hdmi="$(grep -i -m1 hdmi <<<"$sinks")"
+  [[ -n "$hdmi" ]] && timeout 3 pactl set-default-sink "$hdmi" >&3 2>&1
+fi
+log "sound sinks: $(tr '\n' ' ' <<<"$sinks")"
+
+# Use the graphics device the TV is actually plugged into
+for st in /sys/class/drm/card*-*/status; do
+  [[ "$(cat "$st" 2>/dev/null)" == "connected" ]] || continue
+  c="$(basename "$(dirname "$st")")"
+  export WLR_DRM_DEVICES="/dev/dri/${c%%-*}"
+  log "screen found on $(basename "$(dirname "$st")")"
+  break
+done
+if [[ -z "${WLR_DRM_DEVICES:-}" ]]; then
+  for d in /sys/class/drm/card*-*; do
+    [[ -e "$d/status" ]] || continue
+    c="$(basename "$d")"; export WLR_DRM_DEVICES="/dev/dri/${c%%-*}"
+    log "no screen reported as connected; trying ${WLR_DRM_DEVICES}"
+    break
+  done
+fi
+export WLR_LIBINPUT_NO_DEVICES=1
+
 CAGE_OPTS=()
-cage -h 2>&1 | grep -qE '^[[:space:]]*-s' && CAGE_OPTS+=(-s)
+cage -h 2>&1 | grep -q -- ' -s' && CAGE_OPTS+=(-s)   # lets Ctrl+Alt+F2 switch to a console
+log "WLR_DRM_DEVICES=${WLR_DRM_DEVICES:-auto} cage options: ${CAGE_OPTS[*]:-none}"
+
+# run_screen <program> : runs it in cage; stops it if no picture within 45 s
+run_screen() {
+  local start pid ok=0
+  start=$(date +%s)
+  rm -f "$ALIVE"
+  cage "${CAGE_OPTS[@]}" -- "$@" 2>&3 >&3 &
+  pid=$!
+  for _ in $(seq 1 45); do
+    if [[ -f "$ALIVE" ]]; then ok=1; break; fi
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+  done
+  if (( ! ok )) && kill -0 "$pid" 2>/dev/null; then
+    if [[ "$1" == *retroarch* ]]; then ok=1      # RetroArch can't report; give it the benefit of the doubt
+    else
+      log "no picture after 45 s; stopping"
+      kill "$pid"; sleep 3; kill -9 "$pid" 2>/dev/null
+    fi
+  fi
+  wait "$pid"; local rc=$?
+  log "screen program $1 ended (code $rc) after $(( $(date +%s) - start )) s"
+  (( ok )) && (( $(date +%s) - start >= 20 ))
+}
 
 fails=0
 while [[ ! -f "$HOME/.retro-noauto" ]]; do
-  start=$(date +%s)
-  if (( fails < 3 )); then
-    cage "${CAGE_OPTS[@]}" -- /usr/local/bin/retro-dashboard >> "$LOG" 2>&1
-  else
-    # Safety net: if the dashboard keeps failing, RetroArch's own menu still lets you play.
-    echo "dashboard failed repeatedly; starting RetroArch menu" >> "$LOG"
-    cage "${CAGE_OPTS[@]}" -- retroarch >> "$LOG" 2>&1
+  if run_screen /usr/local/bin/retro-start-dashboard; then fails=0; else fails=$((fails + 1)); fi
+  if (( fails >= 3 )); then
+    log "dashboard failed 3 times; trying RetroArch's own menu once"
+    if ! run_screen retroarch; then
+      log "giving up"
+      sudo -n /usr/local/sbin/retro-diag >/dev/null 2>&1
+      clear
+      echo "RetroPi couldn't show its screen. A log was saved as retro-logs.txt on the SD card."
+      echo "Log in below (user retro, password retro), or type: sudo reboot"
+      break
+    fi
     fails=0
   fi
-  if (( $(date +%s) - start < 15 )); then fails=$((fails + 1)); else fails=0; fi
   sleep 1
 done

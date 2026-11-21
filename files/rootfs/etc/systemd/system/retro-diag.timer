@@ -1,0 +1,10 @@
+[Unit]
+Description=RetroPi: copy logs to the SD card during the first minutes after start
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

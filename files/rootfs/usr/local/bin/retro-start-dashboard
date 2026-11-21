@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Runs inside cage. Sets every screen to 1080p (4K is too heavy for games on a
+# Pi 4, and some TVs report a 4K mode the Pi can't drive), then starts the dashboard.
+if command -v wlr-randr >/dev/null; then
+  for out in $(wlr-randr 2>/dev/null | awk '/^[^[:space:]]/{print $1}'); do
+    wlr-randr --output "$out" --on --mode 1920x1080@60Hz 2>/dev/null \
+      || wlr-randr --output "$out" --on --mode 1920x1080 2>/dev/null \
+      || wlr-randr --output "$out" --on --preferred 2>/dev/null
+  done
+  echo "outputs after setup:"; wlr-randr 2>&1 | grep -E '^[^[:space:]]|Enabled|current' 
+fi
+exec /usr/local/bin/retro-dashboard

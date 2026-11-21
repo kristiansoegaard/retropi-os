@@ -23,7 +23,7 @@ apt-get -y --no-install-recommends install \
   libgl1-mesa-dri libegl-mesa0 libgles2 \
   pipewire pipewire-pulse wireplumber pulseaudio-utils dbus-user-session \
   samba unzip curl ca-certificates fonts-dejavu-core \
-  bluez rfkill network-manager cloud-guest-utils
+  bluez rfkill network-manager cloud-guest-utils wlr-randr
 apt-get -y --no-install-recommends install wsdd || echo "wsdd not available; Windows can still open \\\\retropi\\retro directly"
 
 # ---------------------------------------------------------------- user ---
@@ -54,7 +54,7 @@ cp "$SRC/files/boot/retro-wifi.txt" "$BOOT/retro-wifi.txt"
 mkdir -p /usr/share/fonts/truetype/retropi
 cp "$SRC"/fonts/*.ttf /usr/share/fonts/truetype/retropi/ 2>/dev/null || echo "custom fonts missing; using fallback font"
 
-systemctl enable retro-wifi.service retro-boot-check.service
+systemctl enable retro-wifi.service retro-boot-check.service retro-diag.timer
 systemctl enable ssh
 systemctl enable smbd nmbd 2>/dev/null || true
 systemctl enable wsdd 2>/dev/null || true

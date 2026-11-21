@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Copies RetroPi's logs to retro-logs.txt on the SD card's boot drive, so they
+# can be read on any computer. Runs for the first 15 minutes after each start.
+BOOT=/boot/firmware; [[ -d $BOOT ]] || BOOT=/boot
+U=/home/retro/.cache/retro
+up=$(cut -d. -f1 /proc/uptime)
+[[ "${1:-}" == "--timer" && $up -gt 900 ]] && exit 0
+{
+  echo "RetroPi log, written $(date), up ${up}s"
+  grep -E '^(PRETTY_NAME|VERSION_CODENAME)=' /etc/os-release; uname -r
+  tr -d '\0' < /proc/device-tree/model 2>/dev/null; echo
+  echo; echo "== screens"
+  for s in /sys/class/drm/card*-*/status; do echo "$(basename "$(dirname "$s")"): $(cat "$s")"; done
+  ls /dev/dri
+  echo; echo "== running"
+  ps -eo pid,etimes,args | grep -E 'cage|retro|python|pipewire|wireplumber' | grep -v grep
+  echo; echo "== sessions"; loginctl list-sessions --no-pager 2>&1
+  echo; echo "== failed services"; systemctl --failed --no-pager 2>&1
+  echo; echo "== session.log"; tail -n 60 "$U/session.log" 2>&1
+  echo; echo "== dashboard.log"; tail -n 60 "$U/dashboard.log" 2>&1
+  echo; echo "== retroarch.log"; tail -n 30 "$U/retroarch.log" 2>&1
+  echo; echo "== login on tty1"; journalctl -b --no-pager -u getty@tty1 2>&1 | tail -n 15
+  echo; echo "== warnings this boot"; journalctl -b -p warning --no-pager 2>&1 | tail -n 70
+} > "$BOOT/retro-logs.tmp" 2>&1
+mv "$BOOT/retro-logs.tmp" "$BOOT/retro-logs.txt"
+sync

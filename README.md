@@ -69,7 +69,8 @@ Bluetooth controllers: **Settings > Pair a Bluetooth controller**, then put the 
 
 - N64 is the most demanding console. Lighter games run well; some heavier ones will stutter on any Pi 4.
 - The login is user `retro`, password `retro` (for the network share and SSH). To change it, connect with `ssh retro@retropi.local` and run `passwd` and `sudo smbpasswd retro`.
-- If something goes wrong, the logs are in `/home/retro/.cache/retro/` (reachable over SSH).
+- If something goes wrong, wait 3 minutes, then put the SD card in your computer and open **retro-logs.txt** on the **bootfs** drive. It's updated during the first 15 minutes after every start.
+- Safe mode: create an empty file named `retro-safe-mode.txt` on the **bootfs** drive. The Pi then starts to a normal login screen (user `retro`, password `retro`) instead of the dashboard. Delete the file to go back.
 - To stop the dashboard from starting (for tinkering): `touch ~/.retro-noauto` over SSH, then reboot. Delete the file to undo.
 
 ## Building on your own Linux PC instead
