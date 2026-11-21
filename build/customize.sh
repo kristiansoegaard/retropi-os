@@ -47,7 +47,9 @@ rm -f /etc/ssh/sshd_config.d/rename_user.conf
 
 # --------------------------------------------------------------- files ---
 log "Installing RetroPi files"
-cp -a "$SRC/files/rootfs/." /
+# --no-preserve=all: files become root-owned, and existing system folders keep
+# their owner (copying ownership from the build machine breaks logins and more)
+cp -r --no-preserve=all "$SRC/files/rootfs/." /
 chmod 755 /usr/local/bin/retro-* /usr/local/sbin/retro-*
 cp "$SRC/files/boot/retro-wifi.txt" "$BOOT/retro-wifi.txt"
 
@@ -215,6 +217,16 @@ done
 
 # ------------------------------------------------------------- finish ---
 chown -R "$RUSER:$RUSER" "$RHOME"
+
+# Safety check: system folders must belong to root, or the Pi won't start properly
+BAD=""
+for d in / /etc /usr /usr/local /usr/local/bin /usr/local/sbin /etc/systemd /etc/systemd/system /etc/udev /etc/udev/rules.d /var /run /tmp; do
+  [[ -e "$d" && "$(stat -c %u "$d")" != "0" ]] && BAD="$BAD $d"
+done
+if [[ -n "$BAD" ]]; then
+  echo "ERROR: these system folders are not owned by root:$BAD"
+  exit 1
+fi
 apt-get clean
 rm -rf /var/lib/apt/lists/* /tmp/*.zip
 
